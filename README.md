@@ -41,6 +41,9 @@ cmake --build test/app/terminal/build --config Release --target hiyui_terminal
 点击“复制令牌”，将令牌交给连接方。连接方填写 `ws://主机:端口/terminal` 和令牌，
 点击“连接”，打开一个远程标签页。每个监听端口只共享一个本地标签，不允许远端新建 shell。
 
+使用 TCP 隧道时，将隧道目标设置为上述监听地址和端口；连接方填写
+`ws://隧道公网域名:公网端口/terminal`，令牌使用目标标签当前的共享令牌。
+
 | 权限或操作 | 行为 |
 |---|---|
 | `readOnly` | 查看、选择和复制当前屏幕；服务端拒绝键盘、粘贴、焦点和鼠标输入 |
@@ -107,9 +110,10 @@ ctest --test-dir test/cmake-build-debug -R 'Terminal\.' --output-on-failure
 ```
 
 模型、共享协议与真实 PTY/WebSocket 回环测试覆盖输入编码、彩色画面、晚加入、认证、
-权限撤销、多客户端同步、端口占用、退出和令牌失效。
+权限撤销、多客户端同步、端口占用、退出和令牌失效。TCP 隧道测试覆盖延迟握手、双向
+分段传输、错误令牌、输入响应和连接关闭；状态栏布局测试覆盖窗口尺寸、主题和 DPI。
 
 ```powershell
-cmake --build test/cmake-build-debug --target test_terminal_model test_terminal_sharing
-ctest --test-dir test/cmake-build-debug -R '^terminal_(model|sharing)$' --output-on-failure
+cmake --build test/cmake-build-debug --target test_terminal_model test_terminal_sharing test_terminal_layout
+ctest --test-dir test/cmake-build-debug -R '^terminal_(model|sharing|tunnel|layout)$' --output-on-failure
 ```

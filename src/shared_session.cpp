@@ -31,7 +31,10 @@ struct Peer {
   std::atomic<bool> stopped{false};
 
   void stop() {
-    stopped = true;
+    {
+      std::lock_guard lock(mutex);
+      stopped = true;
+    }
     ready.notify_all();
   }
   void send(httplib::ws::WebSocket &ws) {
@@ -54,6 +57,7 @@ struct Peer {
           (next && !ws.send(next->data(), next->size())))
         stop();
     }
+    ws.close(httplib::ws::CloseStatus::GoingAway);
   }
 };
 }
@@ -107,7 +111,7 @@ struct ShareServer::Impl {
       ws.close(httplib::ws::CloseStatus::PolicyViolation, "share unavailable");
       return;
     }
-    ws.set_read_timeout(100ms);
+    ws.set_read_timeout(5s);
     std::thread sender([&ws, peer] { peer->send(ws); });
     std::string message;
     while (!stopped && !peer->stopped) {
@@ -126,7 +130,6 @@ struct ShareServer::Impl {
     }
     peer->stop();
     sender.join();
-    ws.close(httplib::ws::CloseStatus::GoingAway);
     std::lock_guard lock(peersMutex);
     std::erase(peers, peer);
   }
@@ -165,8 +168,8 @@ bool ShareServer::start(const ShareOptions &options, std::string &error) {
 #endif
   });
   s.server->new_task_queue = [] { return new httplib::ThreadPool(4, 12, 16); };
-  s.server->set_read_timeout(2, 0);
-  s.server->set_write_timeout(1, 0);
+  s.server->set_read_timeout(5, 0);
+  s.server->set_write_timeout(5, 0);
   s.server->set_payload_max_length(1024);
   s.server->set_websocket_ping_interval(10);
   s.server->set_websocket_max_missed_pongs(2);
@@ -271,10 +274,42 @@ class RemoteSession final : public TerminalSession {
   Receiver receiver_;
   std::thread worker_;
   std::atomic<bool> stopped_{false};
+  std::atomic<bool> connected_{false};
   std::atomic<Permission> permission_{Permission::ReadOnly};
   std::mutex mutex_;
+  std::condition_variable ready_;
   std::deque<std::string> pending_;
   size_t pendingBytes_ = 0;
+
+  void stopInput() {
+    {
+      std::lock_guard lock(mutex_);
+      stopped_ = true;
+      pending_.clear();
+      pendingBytes_ = 0;
+    }
+    ready_.notify_all();
+  }
+
+  void send() {
+    while (true) {
+      std::string input;
+      {
+        std::unique_lock lock(mutex_);
+        ready_.wait(lock, [this] { return stopped_ || !pending_.empty(); });
+        if (stopped_)
+          return;
+        input = std::move(pending_.front());
+        pending_.pop_front();
+        pendingBytes_ -= input.size();
+      }
+      if (permission_ == Permission::All &&
+          !socket_.send(input.data(), input.size())) {
+        socket_.close();
+        return;
+      }
+    }
+  }
 
   void run() {
     const auto connected = socket_.connect();
@@ -289,29 +324,18 @@ class RemoteSession final : public TerminalSession {
                            std::string(httplib::to_string(connected.error())) +
                            "（HTTP " + std::to_string(connected.status()) +
                            "）"});
-      stopped_ = true;
+      stopInput();
       return;
     }
+    connected_ = true;
+    std::thread sender([this] { send(); });
     bool welcomed = false;
     uint64_t revision = 0;
     std::string message;
     while (!stopped_) {
-      std::deque<std::string> pending;
-      {
-        std::lock_guard lock(mutex_);
-        pending.swap(pending_);
-        pendingBytes_ = 0;
-      }
-      bool sent = true;
-      for (const auto &input : pending)
-        if (permission_ == Permission::All &&
-            !socket_.send(input.data(), input.size())) {
-          sent = false;
-          break;
-        }
-      if (!sent || stopped_)
-        break;
       const auto result = socket_.read(message);
+      if (stopped_)
+        break;
       if (result == httplib::ws::Timeout)
         continue;
       if (result == httplib::ws::Fail)
@@ -344,9 +368,10 @@ class RemoteSession final : public TerminalSession {
     }
     if (!stopped_)
       receiver_({.type = TerminalEvent::Type::Exited, .text = "连接已断开"});
-    stopped_ = true;
+    stopInput();
     permission_ = Permission::ReadOnly;
     socket_.close();
+    sender.join();
   }
 
 public:
@@ -355,9 +380,9 @@ public:
       : socket_(endpoint, {{"Authorization", "Bearer " + token},
                            {"Sec-WebSocket-Protocol", protocol::Name}}),
         receiver_(std::move(receiver)) {
-    socket_.set_connection_timeout(2, 0);
-    socket_.set_read_timeout(20ms);
-    socket_.set_write_timeout(1, 0);
+    socket_.set_connection_timeout(5, 0);
+    socket_.set_read_timeout(5s);
+    socket_.set_write_timeout(5, 0);
     socket_.set_websocket_ping_interval(10);
     socket_.set_websocket_max_missed_pongs(2);
     worker_ = std::thread([this] { run(); });
@@ -370,15 +395,19 @@ public:
     if (message.empty())
       return false;
     std::lock_guard lock(mutex_);
-    if (pendingBytes_ + message.size() > 1024 * 1024)
+    if (stopped_ || permission_ != Permission::All ||
+        pendingBytes_ + message.size() > 1024 * 1024)
       return false;
     pendingBytes_ += message.size();
     pending_.push_back(std::move(message));
+    ready_.notify_one();
     return true;
   }
   void resize(hiyui::TerminalSize) override {}
   void close() override {
-    stopped_ = true;
+    stopInput();
+    if (connected_)
+      socket_.close();
     if (worker_.joinable())
       worker_.join();
   }

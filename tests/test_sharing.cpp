@@ -1,3 +1,4 @@
+#include "delayed_tunnel.h"
 #include "share_protocol.h"
 #include "shared_session.h"
 #include <chrono>
@@ -373,12 +374,131 @@ void sessionLifetimeTests(const char *executable) {
     session.reset();
   }
 }
+
+void tunnelTests(const char *executable) {
+  Inbox local;
+  std::string error;
+  auto session = LocalSession::start(
+      {"fixture", {executable, "--shell-fixture"}}, {80, 24},
+      [&](TerminalEvent event) { local.receive(std::move(event)); }, error);
+  require(bool(session), error.c_str());
+  require(local.wait([](const TerminalEvent &e) {
+    return e.text.find("READY") != std::string::npos;
+  }),
+          "Tunnel fixture failed to start");
+  ShareServer server(session);
+  require(server.start({"127.0.0.1", 0, Permission::ReadOnly}, error),
+          error.c_str());
+  {
+    DelayedTunnel tunnel(server.port(), 150ms);
+    Inbox remote;
+    auto client = connectRemote(
+        tunnel.endpoint(), server.token(),
+        [&](TerminalEvent event) { remote.receive(std::move(event)); }, error);
+    require(bool(client), error.c_str());
+    require(remote.wait([](const TerminalEvent &e) {
+      return e.type == TerminalEvent::Type::Connected ||
+             e.type == TerminalEvent::Type::Error;
+    }),
+            "Delayed handshake did not finish");
+    {
+      std::lock_guard lock(remote.mutex);
+      for (const auto &event : remote.events)
+        if (event.type == TerminalEvent::Type::Error)
+          throw std::runtime_error("Delayed handshake failed: " + event.text);
+    }
+    require(remote.wait([](const TerminalEvent &e) {
+      return e.type == TerminalEvent::Type::Screen &&
+             e.text.find("READY") != std::string::npos;
+    }),
+            "Split screen frame was lost");
+    require(!client->input({.text = "x"}), "Tunnel bypassed read-only access");
+    server.permission(Permission::All);
+    require(remote.wait([](const TerminalEvent &e) {
+      return e.type == TerminalEvent::Type::PermissionChanged &&
+             e.permission == Permission::All;
+    }),
+            "Split permission frame was lost");
+    const auto inputTime = std::chrono::steady_clock::now();
+    require(client->input({.text = "t"}), "Tunnel input was not queued");
+    require(remote.wait([](const TerminalEvent &e) {
+      return e.type == TerminalEvent::Type::Screen &&
+             e.text.find("SEEN:t") != std::string::npos;
+    }),
+            "Split input or echoed screen was lost");
+    require(std::chrono::steady_clock::now() - inputTime < 2s,
+            "Input waited for the network read timeout");
+    {
+      std::lock_guard lock(local.mutex);
+      std::string output;
+      for (const auto &event : local.events)
+        output += event.text;
+      const auto first = output.find("SEEN:t");
+      require(first != std::string::npos &&
+                  output.find("SEEN:t", first + 1) == std::string::npos,
+              "Tunnel duplicated input");
+    }
+    server.permission(Permission::ReadOnly);
+    require(remote.wait([](const TerminalEvent &e) {
+      return e.type == TerminalEvent::Type::PermissionChanged &&
+             e.permission == Permission::ReadOnly;
+    }),
+            "Tunnel lost permission revocation");
+    require(!client->input({.text = "x"}), "Revoked tunnel allowed input");
+    const auto closeTime = std::chrono::steady_clock::now();
+    client->close();
+    client->close();
+    require(std::chrono::steady_clock::now() - closeTime < 2s,
+            "Closing the tunnel waited for the network read timeout");
+  }
+  {
+    DelayedTunnel tunnel(server.port(), 150ms);
+    Inbox rejected;
+    auto token = server.token();
+    token[0] = token[0] == '0' ? '1' : '0';
+    auto client = connectRemote(
+        tunnel.endpoint(), token,
+        [&](TerminalEvent event) { rejected.receive(std::move(event)); },
+        error);
+    require(bool(client), "Rejected tunnel could not be created");
+    require(rejected.wait([](const TerminalEvent &e) {
+      return e.type == TerminalEvent::Type::Error &&
+             e.text.find("认证失败") != std::string::npos;
+    }),
+            "Delayed authentication rejection was not distinguished from I/O "
+            "failure");
+    client->close();
+  }
+  {
+    DelayedTunnel tunnel(server.port(), 6s);
+    Inbox canceled;
+    auto client = connectRemote(
+        tunnel.endpoint(), server.token(),
+        [&](TerminalEvent event) { canceled.receive(std::move(event)); },
+        error);
+    require(bool(client) && tunnel.waitForTraffic(),
+            "Stalled handshake did not begin");
+    const auto closeTime = std::chrono::steady_clock::now();
+    client->close();
+    require(std::chrono::steady_clock::now() - closeTime < 6s,
+            "Canceled handshake did not respect the connection deadline");
+    std::lock_guard lock(canceled.mutex);
+    require(canceled.events.empty(), "Canceled connection delivered an event");
+  }
+  server.stop();
+  session->close();
+}
 }
 
 int main(int argc, char **argv) {
   if (argc == 2 && std::string_view(argv[1]) == "--shell-fixture")
     return shellFixture();
   try {
+    if (argc == 2 && std::string_view(argv[1]) == "--tunnel-tests") {
+      tunnelTests(argv[0]);
+      std::cout << "delayed TCP tunnel sharing passed\n";
+      return 0;
+    }
     protocolTests();
     sharingTests(argv[0]);
     sessionLifetimeTests(argv[0]);

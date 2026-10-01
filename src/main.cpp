@@ -1,4 +1,5 @@
 #include "shared_session.h"
+#include "terminal_layout.h"
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -518,11 +519,7 @@ class TerminalApp final : public Application {
                     .textColor(ThemeRole::TextSecondary)),
         Box{}.fillWidth().flex(1).ref(content_)(
             Label({.text = "选择 shell 并新建会话"}).center().ref(empty_)),
-        Label({.fontSize = 12, .ellipsis = true})
-            .fillWidth()
-            .padding(6)
-            .textColor(ThemeRole::TextSecondary)
-            .ref(status_)));
+        statusBar(status_)));
     std::vector<DropdownItem> items;
     for (const auto &profile : profiles_)
       items.push_back({.text = profile.name.c_str()});
